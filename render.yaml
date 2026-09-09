@@ -18,7 +18,6 @@ services:
         value: production
 
       # Set this to your deployed frontend URL
-      # Example: https://secure-case.vercel.app
       - key: FRONTEND_ORIGIN
         sync: false
 
@@ -41,13 +40,12 @@ services:
         sync: false
 
       # Google Gemini
-    - key: GEMINI_API_KEY
-  sync: false
+      - key: GEMINI_API_KEY
+        sync: false
 
-- key: GEMINI_MODEL
-  value: gemini-3.6-flash
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
 
       # Ollama is intended for local development.
-      # Render does not provide Ollama at localhost:11434.
       - key: OLLAMA_URL
         value: http://localhost:11434

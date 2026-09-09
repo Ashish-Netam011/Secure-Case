@@ -1,7 +1,9 @@
 import axios from "axios";
 
 const API = axios.create({
-  baseURL: "/api",
+  // In dev the Vite proxy forwards /api to localhost:5000. In production set
+  // VITE_API_URL (e.g. https://secure-case-api.onrender.com/api) at build time.
+  baseURL: import.meta.env.VITE_API_URL || "/api",
 });
 
 API.interceptors.request.use((config) => {
