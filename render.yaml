@@ -1,0 +1,53 @@
+# Render Blueprint for Secure Case API
+# Deploy from Render Dashboard → New → Blueprint
+
+services:
+  - type: web
+    name: secure-case-api
+    runtime: node
+    rootDir: Backend
+    plan: free
+
+    buildCommand: npm ci
+    startCommand: npm start
+
+    healthCheckPath: /healthz
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # Set this to your deployed frontend URL
+      # Example: https://secure-case.vercel.app
+      - key: FRONTEND_ORIGIN
+        sync: false
+
+      # MongoDB Atlas connection string
+      - key: MONGO_URI
+        sync: false
+
+      # Render generates this automatically
+      - key: JWT_SECRET
+        generateValue: true
+
+      # Authentication PIN hashes
+      - key: IO_PIN_HASH
+        sync: false
+
+      - key: LO_PIN_HASH
+        sync: false
+
+      - key: ADMIN_PIN_HASH
+        sync: false
+
+      # Google Gemini
+    - key: GEMINI_API_KEY
+  sync: false
+
+- key: GEMINI_MODEL
+  value: gemini-3.6-flash
+
+      # Ollama is intended for local development.
+      # Render does not provide Ollama at localhost:11434.
+      - key: OLLAMA_URL
+        value: http://localhost:11434
