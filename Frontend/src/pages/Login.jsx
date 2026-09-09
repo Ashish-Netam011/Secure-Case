@@ -1,48 +1,59 @@
 import { useState } from "react";
 import {
   ShieldCheck,
-  LockKeyhole,
-  Eye,
-  EyeOff,
   AlertTriangle,
-  LogIn,
   CheckCircle2,
+  FileSearch,
+  Scale,
+  UserCog,
+  ChevronRight,
 } from "lucide-react";
 import API from "../services/api";
 
+const DEMO_ROLES = [
+  {
+    role: "Investigating Officer",
+    description: "Upload and analyze case evidence",
+    clearance: "L3",
+    icon: FileSearch,
+  },
+  {
+    role: "Legal Officer",
+    description: "Review approved evidence and findings",
+    clearance: "L2",
+    icon: Scale,
+  },
+  {
+    role: "Administrator",
+    description: "Approve requests and manage the system",
+    clearance: "L4",
+    icon: UserCog,
+  },
+];
+
 function Login({ onLogin }) {
-  const [pin, setPin] = useState("");
-  const [showPin, setShowPin] = useState(false);
+  const [activeRole, setActiveRole] = useState(null);
   const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
 
-  async function handleSubmit(event) {
-    event.preventDefault();
-
+  async function handleRoleLogin(role) {
     setError("");
     setSuccess(false);
+    setActiveRole(role);
 
-    if (!pin) {
-      setError("Security PIN is required.");
-      return;
-    }
-
-    if (!/^\d{6}$/.test(pin)) {
-      setError("Security PIN must contain exactly six digits.");
-      return;
-    }
-
-    setLoading(true);
     try {
-      const response = await API.post("/auth/login", { pin });
+      const response = await API.post("/auth/demo-login", { role });
       localStorage.setItem("token", response.data.token);
       setSuccess(true);
       onLogin(response.data.user);
     } catch (requestError) {
-      setError(requestError.response?.data?.message || "Unable to authenticate.");
-    } finally {
-      setLoading(false);
+      const status = requestError.response?.status;
+      setError(
+        status === 404
+          ? "Role quick-login is not enabled on this server."
+          : requestError.response?.data?.message || "Unable to authenticate.",
+      );
+      setActiveRole(null);
     }
   }
 
@@ -99,139 +110,97 @@ function Login({ onLogin }) {
             </h2>
 
             <p className="mt-2 text-xs leading-5 text-slate-500">
-              Verify your identity to access protected
-              case records and digital evidence.
+              Select your role to access the corresponding
+              dashboard and its protected capabilities.
             </p>
 
           </div>
 
           {}
-          <form
-            onSubmit={handleSubmit}
-            className="space-y-5"
-          >
+          <div className="space-y-3">
 
-            {}
-            <div>
+            {DEMO_ROLES.map(({ role, description, clearance, icon: RoleIcon }) => {
+              const isLoading = activeRole === role;
 
-              <label
-                htmlFor="security-pin"
-                className="mb-2 block text-[10px] font-bold uppercase tracking-wider text-slate-500"
-              >
-                Security PIN
-              </label>
-
-              <div className="relative">
-
-                <LockKeyhole
-                  size={15}
-                  aria-hidden="true"
-                  className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600"
-                />
-
-                <input
-                  id="security-pin"
-                  type={showPin ? "text" : "password"}
-                  value={pin}
-                  onChange={(e) => {
-                    const value = e.target.value
-                      .replace(/\D/g, "")
-                      .slice(0, 6);
-
-                    setPin(value);
-                    setError("");
-                    setSuccess(false);
-                  }}
-                  placeholder="Enter Security PIN"
-                  inputMode="numeric"
-                  autoComplete="current-password"
-                  maxLength={6}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 py-3 pl-10 pr-10 text-xs tracking-widest text-white placeholder:tracking-normal placeholder:text-slate-700 outline-none transition focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/20"
-                />
-
+              return (
                 <button
+                  key={role}
                   type="button"
-                  aria-label={
-                    showPin
-                      ? "Hide security PIN"
-                      : "Show security PIN"
-                  }
-                  onClick={() => setShowPin((value) => !value)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 transition hover:text-slate-300"
+                  disabled={activeRole !== null}
+                  onClick={() => handleRoleLogin(role)}
+                  aria-label={`Log in as ${role}`}
+                  className="group flex w-full items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-4 text-left transition hover:border-emerald-500/40 hover:bg-slate-900/60 focus:outline-none focus:ring-2 focus:ring-emerald-400/30 disabled:cursor-not-allowed disabled:opacity-50 enabled:hover:disabled:opacity-50 aria-disabled:opacity-50"
                 >
-                  {showPin ? (
-                    <EyeOff size={15} />
-                  ) : (
-                    <Eye size={15} />
-                  )}
+
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-900 text-emerald-400 transition group-hover:border-emerald-500/30 group-hover:bg-emerald-500/10">
+                    {isLoading ? (
+                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-emerald-500/30 border-t-emerald-400" />
+                    ) : (
+                      <RoleIcon size={18} strokeWidth={1.8} />
+                    )}
+                  </span>
+
+                  <span className="min-w-0 flex-1">
+
+                    <span className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-white">
+                        {role}
+                      </span>
+
+                      <span className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-slate-500">
+                        {clearance}
+                      </span>
+                    </span>
+
+                    <span className="mt-0.5 block truncate text-[10px] leading-4 text-slate-500">
+                      {description}
+                    </span>
+
+                  </span>
+
+                  <ChevronRight
+                    size={15}
+                    className="shrink-0 text-slate-700 transition group-hover:text-emerald-400"
+                  />
+
                 </button>
+              );
+            })}
 
-              </div>
+          </div>
 
-              <p className="mt-2 text-[9px] text-slate-700">
-                Authorized personnel only
-              </p>
-
-            </div>
-
-            {}
-            {error && (
-              <div
-                role="alert"
-                className="flex items-start gap-2 rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-[10px] leading-5 text-red-400"
-              >
-
-                <AlertTriangle
-                  size={14}
-                  className="mt-0.5 shrink-0"
-                />
-
-                <span>{error}</span>
-
-              </div>
-            )}
-
-            {}
-            {success && (
-              <div
-                role="status"
-                className="flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 text-[10px] text-emerald-400"
-              >
-
-                <CheckCircle2 size={14} />
-
-                <span>
-                  Identity verified. Checking access permissions...
-                </span>
-
-              </div>
-            )}
-
-            {}
-            <button
-              type="submit"
-              disabled={loading}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 py-3 text-xs font-bold text-slate-950 transition hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-400/40 disabled:cursor-not-allowed disabled:opacity-60"
+          {}
+          {error && (
+            <div
+              role="alert"
+              className="mt-4 flex items-start gap-2 rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-[10px] leading-5 text-red-400"
             >
 
-              {loading ? (
-                <>
-                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-900/30 border-t-slate-900" />
+              <AlertTriangle
+                size={14}
+                className="mt-0.5 shrink-0"
+              />
 
-                  {success
-                    ? "Authorizing Access..."
-                    : "Verifying Identity..."}
-                </>
-              ) : (
-                <>
-                  <LogIn size={15} />
-                  Secure Login
-                </>
-              )}
+              <span>{error}</span>
 
-            </button>
+            </div>
+          )}
 
-          </form>
+          {}
+          {success && (
+            <div
+              role="status"
+              className="mt-4 flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 text-[10px] text-emerald-400"
+            >
+
+              <CheckCircle2 size={14} />
+
+              <span>
+                Identity verified. Loading role dashboard...
+              </span>
+
+            </div>
+          )}
 
           {}
           <div className="mt-6 rounded-lg border border-slate-800 bg-slate-950/50 p-4">

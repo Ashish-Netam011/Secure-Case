@@ -24,7 +24,7 @@ import AccessRequest from "./models/AccessRequest.js";
 import AuditEvent from "./models/AuditEvent.js";
 import Evidence from "./models/Evidence.js";
 import { analyzeEvidence } from "../services/aiService.js";
-import { authenticatePin, requireAuth, requireRole, signUser } from "./middleware/auth.js";
+import { authenticatePin, getDemoUserByRole, requireAuth, requireRole, signUser } from "./middleware/auth.js";
 
 configDotenv({ override: true });
 
@@ -104,6 +104,28 @@ app.post("/api/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, sta
   const { pinHash, ...publicUser } = user;
   return res.json({ success: true, token: signUser(publicUser), user: publicUser });
 });
+
+// Demo convenience route: bypasses the PIN check for a chosen role. Disabled
+// unless DEMO_LOGIN=1 — production deployments must not enable it.
+if (process.env.DEMO_LOGIN === "1" || process.env.DEMO_LOGIN === "true") {
+  const demoRoles = ["Investigating Officer", "Legal Officer", "Administrator"];
+  app.post(
+    "/api/auth/demo-login",
+    rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: "draft-8", legacyHeaders: false }),
+    async (req, res) => {
+      const role = typeof req.body?.role === "string" ? req.body.role : "";
+      if (!demoRoles.includes(role)) {
+        return res.status(400).json({ success: false, message: "Unknown role requested." });
+      }
+
+      const user = getDemoUserByRole(role);
+      if (!user) return res.status(401).json({ success: false, message: "Role is not configured." });
+
+      const { pinHash, ...publicUser } = user;
+      return res.json({ success: true, token: signUser(publicUser), user: publicUser });
+    },
+  );
+}
 
 app.use("/api", requireAuth);
 

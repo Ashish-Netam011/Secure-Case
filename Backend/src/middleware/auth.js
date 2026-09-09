@@ -41,6 +41,11 @@ const demoUsers = [
   },
 ];
 
+export function getDemoUserByRole(role) {
+  if (typeof role !== "string") return null;
+  return demoUsers.find((user) => user.role === role) || null;
+}
+
 export async function authenticatePin(pin) {
   for (const user of demoUsers) {
     if (user.pinHash && await bcrypt.compare(pin, user.pinHash)) return user;
