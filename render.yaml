@@ -39,6 +39,11 @@ services:
       - key: ADMIN_PIN_HASH
         sync: false
 
+      # Set to 1 so the three role quick-login buttons work on the demo frontend.
+      # Clear this variable and redeploy after the demo to require PIN logins.
+      - key: DEMO_LOGIN
+        value: "1"
+
       # Google Gemini
       - key: GEMINI_API_KEY
         sync: false
