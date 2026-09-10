@@ -44,13 +44,36 @@ services:
       - key: DEMO_LOGIN
         value: "1"
 
-      # Google Gemini
+      # Google Gemini (fast first-pass analysis)
       - key: GEMINI_API_KEY
         sync: false
 
       - key: GEMINI_MODEL
-        value: gemini-3.6-flash
+        value: gemini-3.5-flash-lite
 
-      # Ollama is intended for local development.
+      - key: AI_REQUEST_TIMEOUT_MS
+        value: "15000"
+
+      - key: AI_ANALYSIS_VERSION
+        value: fast-v1
+
+      # Ollama Cloud (Nemotron) fallback — API key stays server-side.
+      - key: OLLAMA_API_KEY
+        sync: false
+
+      - key: OLLAMA_MODEL
+        value: nemotron:cloud
+
+      - key: OLLAMA_BASE_URL
+        value: https://ollama.com
+
+      - key: OLLAMA_TIMEOUT_MS
+        value: "45000"
+
+      # No Ollama daemon exists on Render: disable the localhost fallback.
+      - key: OLLAMA_LOCAL
+        value: "0"
+
+      # Kept for local development only.
       - key: OLLAMA_URL
         value: http://localhost:11434

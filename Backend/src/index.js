@@ -44,6 +44,9 @@ if (process.env.NODE_ENV === "production" && !process.env.FRONTEND_ORIGIN) {
 
 const app = express();
 const inFlightAnalyses = new Map();
+// Bumped whenever the analysis prompt/schema/model changes so previously stored
+// results are regenerated instead of served stale.
+const AI_ANALYSIS_VERSION = process.env.AI_ANALYSIS_VERSION || "fast-v1";
 
 app.set("trust proxy", 1);
 
@@ -147,7 +150,7 @@ async function verifyEvidenceIntegrity(evidence, req) {
   if (currentHash === evidence.sha256) return true;
 
   await recordAudit({
-    action: "Evidence tamper detected",
+    action: "Evidence tampering detected",
     status: "ALERT",
     officerId: req.user?.id,
     evidence: evidence._id,
@@ -157,8 +160,14 @@ async function verifyEvidenceIntegrity(evidence, req) {
 }
 
 async function getAuthorizedEvidence(id, req) {
-  const evidence = await Evidence.findById(id);
+  // +data: the buffer is select:false in the schema (list/cache paths skip the
+  // potentially large file bytes), but authorization callers need it for the
+  // integrity re-hash and content serving.
+  const evidence = await Evidence.findById(id).select("+data");
   if (!evidence) return { error: { status: 404, message: "Evidence not found." } };
+  if (evidence.status === "TAMPERED") {
+    return { error: { status: 452, message: "Evidence integrity may have been compromised. Access blocked." } };
+  }
 
   const requesterId = req.user.id;
   const requesterRole = req.user.role;
@@ -237,7 +246,7 @@ app.post("/api/evidence/upload", requireRole("Administrator", "Investigating Off
   }
 });
 
-app.post("/api/ai/analyze", async (req, res, next) => {
+app.post("/api/ai/analyze", requireRole("Administrator","Investigating Officer","Legal Officer"), async (req, res, next) => {
   const requestStartedAt = performance.now();
   const text =
     typeof req.body?.text === "string"
@@ -251,10 +260,10 @@ app.post("/api/ai/analyze", async (req, res, next) => {
     });
   }
 
-  if (text.length > 50000) {
+  if (text.length > 120000) {
     return res.status(413).json({
       success: false,
-      message: "Text must be 50,000 characters or fewer.",
+      message: "Text must be 120,000 characters or fewer.",
     });
   }
 
@@ -277,12 +286,24 @@ app.post("/api/ai/analyze", async (req, res, next) => {
     }
     const mongoLookupMs = Math.round(performance.now() - lookupStartedAt);
 
-    if (evidence?.aiAnalysis?.analysis) {
+    if (evidence?.aiAnalysis?.analysis && evidence.aiAnalysis.version === AI_ANALYSIS_VERSION) {
+      console.info(
+        `[AI-PERF] analyze cached total:${Math.round(performance.now() - requestStartedAt)}ms lookup:${mongoLookupMs}ms provider=${evidence.aiAnalysis.provider} model=${evidence.aiAnalysis.model}`,
+      );
+      recordAudit({
+        action: "AI analysis served from cache",
+        status: "AUTHORIZED",
+        officerId: req.user.id,
+        evidence: evidence._id,
+        reason: `Cached ${evidence.aiAnalysis.model} (provider: ${evidence.aiAnalysis.provider}), version ${AI_ANALYSIS_VERSION}.`,
+      }).catch(function () {});
       return res.json({
         success: true,
         analysis: evidence.aiAnalysis.analysis,
         model: evidence.aiAnalysis.model,
+        provider: evidence.aiAnalysis.provider,
         cached: true,
+        status: evidence.status,
         responseTime: `${Math.round(performance.now() - requestStartedAt)} ms`,
         timings: { mongoLookupMs, totalRequestMs: Math.round(performance.now() - requestStartedAt) },
       });
@@ -303,10 +324,12 @@ app.post("/api/ai/analyze", async (req, res, next) => {
 
     const analysisPromise = (async () => {
       const analysisResult = await analyzeEvidence(text);
+      const storeStartedAt = performance.now();
       await Evidence.updateOne(
         { _id: evidence._id },
-        { $set: { aiAnalysis: { analysis: analysisResult.result, model: analysisResult.model, analyzedAt: new Date() } } },
+        { $set: { aiAnalysis: { analysis: analysisResult.result, model: analysisResult.model, provider: analysisResult.provider, version: AI_ANALYSIS_VERSION, analyzedAt: new Date() } } },
       );
+      analysisResult.timings.mongoStoreMs = Math.round(performance.now() - storeStartedAt);
       return analysisResult;
     })();
     inFlightAnalyses.set(analysisKey, analysisPromise);
@@ -319,16 +342,31 @@ app.post("/api/ai/analyze", async (req, res, next) => {
     }
 
     const { result, model, provider, timings } = analysisOutcome;
-    const mongoStoreMs = 0;
+    const mongoStoreMs = analysisOutcome.timings?.mongoStoreMs ?? 0;
 
     const responseTime = Math.round(performance.now() - requestStartedAt);
+
+    if (evidence.status !== "APPROVED") {
+      await Evidence.findByIdAndUpdate(evidence._id, { $set: { status: "APPROVED" } });
+      await recordAudit({
+        action: "Evidence auto-approved for AI analysis",
+        status: "APPROVED",
+        officerId: req.user.id,
+        evidence: evidence._id,
+        reason: `Status changed to APPROVED by AI analysis request from ${req.user.role}.`,
+      });
+    }
+
+    console.info(
+      `[AI-PERF] analyze route total:${responseTime}ms lookup:${mongoLookupMs}ms store:${analysisOutcome.timings?.mongoStoreMs ?? "?"}ms provider=${provider} model=${model}`,
+    );
 
     await recordAudit({
       action: "AI analysis completed",
       status: "AUTHORIZED",
       officerId: req.user.id,
       evidence: evidence._id,
-      reason: `Model ${model} (${provider} tier).`,
+      reason: `Model ${model} (provider: ${provider}), status: ${evidence.status}.`,
     });
 
     return res.json({
@@ -346,6 +384,10 @@ app.post("/api/ai/analyze", async (req, res, next) => {
       inFlightAnalyses.delete(String(req.body.evidenceId));
     }
 
+    console.info(
+      `[AI-PERF] analyze FAILED after ${Math.round(performance.now() - requestStartedAt)}ms: ${error.message?.slice(0, 300)}`,
+    );
+
     try {
       await recordAudit({
         action: "AI analysis failed",
@@ -358,9 +400,12 @@ app.post("/api/ai/analyze", async (req, res, next) => {
       // Audit failures must not mask the AI error response.
     }
 
-    return res.status(502).json({
+    // Graceful degradation: every provider failed. Evidence access, integrity,
+    // audit and all other features remain fully functional.
+    return res.status(503).json({
       success: false,
-      message: error.message || "Ollama analysis failed.",
+      message: "AI analysis is temporarily unavailable. Evidence access is unaffected.",
+      fallback: false,
     });
   }
 });
@@ -372,9 +417,16 @@ app.get("/api/evidence", async (req, res, next) => {
       .lean();
     const data = evidence.map((item) => {
       const { data: fileData, ...metadata } = item;
+      const currentHash = fileData ? getEvidenceHash(fileData) : null;
+      const integrityStatus = fileData
+        ? currentHash === item.sha256
+          ? "VERIFIED"
+          : "TAMPERED"
+        : "UNKNOWN";
       return {
         ...metadata,
-        integrityStatus: fileData && getEvidenceHash(fileData) === item.sha256 ? "VERIFIED" : "TAMPERED",
+        sha256Current: currentHash ?? undefined,
+        integrityStatus,
       };
     });
     res.json({ success: true, data });
@@ -457,8 +509,8 @@ app.patch("/api/access-requests/:id", async (req, res, next) => {
       action: `Evidence access ${status.toLowerCase()}`,
       status,
       officerId: request.officerId,
-      adminId: req.user.id,
-      evidence: request.evidence?._id || request.evidence,
+      adminId: req.user.id,        evidence: request.evidence?._id || request.evidence,
+        status: request.status,
       request: request._id,
       reason: request.reason,
     });
@@ -474,7 +526,7 @@ app.get("/api/evidence/:id/content", async (req, res, next) => {
     if (authorization.error) return res.status(authorization.error.status).json({ success: false, message: authorization.error.message });
     const { evidence } = authorization;
     if (!(await verifyEvidenceIntegrity(evidence, req))) {
-      return res.status(409).json({ success: false, code: "EVIDENCE_TAMPERED", message: "TAMPER ALERT: Evidence integrity verification failed. Access has been blocked." });
+      return res.status(409).json({ success: false, code: "EVIDENCE_TAMPERED", message: "TAMPER ALERT: Evidence tampering detected — integrity verification failed. Access has been blocked." });
     }
     const administrator = req.user.role === "Administrator";
 
@@ -535,11 +587,27 @@ app.get("/api/audit-events", async (req, res, next) => {
   }
 });
 
+app.get("/health",(req,res)=>{
+  const successResponse = (response, payload) => response.json(payload);
+  successResponse(res, {
+    status:"ok",
+    timestamp:new Date().toISOString(),
+    uptime:process.uptime()
+  });
+});
+
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({
       success: false,
       message: "Evidence file must be smaller than 15 MB.",
+    });
+  }
+
+  if (error?.type === "entity.too.large") {
+    return res.status(413).json({
+      success: false,
+      message: "Extracted text exceeds the 120,000-character analysis limit.",
     });
   }
 

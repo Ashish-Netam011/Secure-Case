@@ -165,6 +165,8 @@ function EvidenceViewer({
   const [analyzing, setAnalyzing] = useState(false);
   const [pdfText, setPdfText] = useState("");
   const [viewMode, setViewMode] = useState("original");
+  const [analysisProvider, setAnalysisProvider] = useState("");
+  const [statusLine, setStatusLine] = useState("");
 
   if (!file) return null;
 
@@ -176,7 +178,21 @@ function EvidenceViewer({
 
     setAnalysis("");
     setAnalysisError("");
+    setAnalysisProvider("");
     setAnalyzing(true);
+
+    // Honest progress: rotating activity labels, never fake percentages.
+    const statusMessages = [
+      "Analyzing evidence…",
+      "Extracting relevant information…",
+      "Generating investigation summary…",
+    ];
+    let statusIndex = 0;
+    setStatusLine(statusMessages[0]);
+    const statusTimer = window.setInterval(() => {
+      statusIndex = (statusIndex + 1) % statusMessages.length;
+      setStatusLine(statusMessages[statusIndex]);
+    }, 2500);
 
     try {
       let evidenceText = availableText;
@@ -191,23 +207,19 @@ function EvidenceViewer({
         }
         evidenceText = pages.join("\n\n").trim();
         setPdfText(evidenceText);
-        console.info("AI analysis timings:", {
-          textExtractionMs: Math.round(performance.now() - extractionStartedAt),
-          textLength: evidenceText.length,
-        });
+        console.info(
+          `[AI-PERF] pdf-extraction:${Math.round(performance.now() - extractionStartedAt)}ms chars:${evidenceText.length}`,
+        );
       }
 
       if (!evidenceText) {
-        setAnalysisError("No readable text was found in this evidence file.");
+        setAnalysisError("No readable text was found in this evidence file. Scanned or image-only PDFs cannot be analyzed as text.");
         return;
       }
 
       const requestStartedAt = performance.now();
       if (extractionMs !== undefined) {
-        console.info("AI analysis text extraction:", {
-          textExtractionMs: extractionMs,
-          textLength: evidenceText.length,
-        });
+        console.info(`[AI-PERF] pdf-extraction:${extractionMs}ms chars:${evidenceText.length}`);
       }
       const response = await API.post("/ai/analyze", {
         text: redactPII(evidenceText).text,
@@ -216,10 +228,11 @@ function EvidenceViewer({
         officerId,
         role,
       });
-      console.info("AI analysis frontend request:", {
-        requestMs: Math.round(performance.now() - requestStartedAt),
-      });
+      console.info(
+        `[AI-PERF] frontend request:${Math.round(performance.now() - requestStartedAt)}ms provider=${response.data?.provider || "?"} cached=${response.data?.cached ? "yes" : "no"}`,
+      );
       setAnalysis(response.data.analysis || response.data.result || "No analysis was returned.");
+      setAnalysisProvider(response.data.provider || "");
       onLog?.(`AI analysis completed: ${file.name}`, "AUTHORIZED");
     } catch (error) {
       setAnalysisError(
@@ -228,6 +241,8 @@ function EvidenceViewer({
       );
       onLog?.(`AI analysis failed: ${file.name}`, "ERROR");
     } finally {
+      window.clearInterval(statusTimer);
+      setStatusLine("");
       setAnalyzing(false);
     }
   }
@@ -393,7 +408,7 @@ function EvidenceViewer({
                     ? mode === "pdf"
                       ? "Extract and analyze readable PDF text through the secure backend."
                       : "Analyze readable evidence text through the secure backend."
-                    : "No readable text was found in this evidence file."}
+                    : "Scanned or image-only files cannot be analyzed as text."}
                 </p>
               </div>
               <button
@@ -406,6 +421,13 @@ function EvidenceViewer({
               </button>
             </div>
 
+            {analyzing && statusLine && (
+              <p className="mt-3 flex items-center gap-2 text-[10px] text-indigo-300">
+                <LoaderCircle size={12} className="animate-spin" />
+                {statusLine}
+              </p>
+            )}
+
             {analysisError && (
               <p className="mt-3 rounded-md border border-red-500/20 bg-red-500/5 p-3 text-[10px] text-red-400">
                 {analysisError}
@@ -414,9 +436,18 @@ function EvidenceViewer({
 
             {analysis && (
               <div className="mt-3 space-y-2 rounded-md border border-indigo-500/20 bg-slate-950/50 p-3">
-                <p className="mb-2 text-[10px] font-bold uppercase tracking-wider text-indigo-300">
-                  AI Analysis Result
-                </p>
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-indigo-300">
+                    AI Analysis Result
+                  </p>
+                  {analysisProvider && (
+                    <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-indigo-300">
+                      {analysisProvider === "gemini"
+                        ? "AI Analysis • Gemini"
+                        : `AI Analysis • Fallback (${analysisProvider.replace("ollama-", "")})`}
+                    </span>
+                  )}
+                </div>
                 {renderAnalysisSections(analysis)}
               </div>
             )}

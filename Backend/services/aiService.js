@@ -2,68 +2,42 @@ import { configDotenv } from "dotenv";
 
 configDotenv();
 
-const ollamaUrl = (process.env.OLLAMA_URL || "http://localhost:11434").replace(/\/$/, "");
-const ollamaModel = process.env.OLLAMA_MODEL || "qwen2.5:3b";
-// Hybrid AI, cloud-first: 1) Gemini cloud API (when GEMINI_API_KEY is set),
-// 2) Ollama cloud models (suffixed ":cloud", reached through the local Ollama
-// daemon, no separate key), 3) local Ollama model as the final fallback.
-const cloudModel = process.env.AI_CLOUD_MODEL || "deepseek-v4-flash:cloud";
+// ---------------------------------------------------------------------------
+// Provider configuration (all overridable via environment; secrets stay
+// server-side and are never logged).
+// ---------------------------------------------------------------------------
 const geminiApiKey = (process.env.GEMINI_API_KEY || "").trim();
-const geminiModel = process.env.GEMINI_MODEL || "gemini-2.0-flash";
-const requestTimeoutMs = Number(process.env.AI_REQUEST_TIMEOUT_MS || 120000);
+// Fast first-pass model. gemini-3.5-flash-lite measured 3.4s on a ~24K-char
+// legal payload with valid schema JSON; gemini-3.6-flash measured 38.9s+.
+const geminiModel = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+// Gemini first-pass must feel fast; overloaded-model 503s fail over instead of hanging.
+const geminiTimeoutMs = Number(process.env.AI_REQUEST_TIMEOUT_MS || 15000);
 
-const analysisSchema = {
-  type: "object",
-  properties: {
-    summary: { type: "string" },
-    classification: { type: "string" },
-    confidence: { type: "number" },
-    entities: {
-      type: "object",
-      properties: {
-        persons: { type: "array", items: { type: "string" } },
-        organizations: { type: "array", items: { type: "string" } },
-        locations: { type: "array", items: { type: "string" } },
-        dates: { type: "array", items: { type: "string" } },
-      },
-    },
-    timeline: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          date: { type: "string" },
-          event: { type: "string" },
-        },
-        required: ["date", "event"],
-      },
-    },
-    relationships: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          relationship: { type: "string" },
-          support: { type: "string" },
-        },
-        required: ["relationship", "support"],
-      },
-    },
-    followupEvidence: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          item: { type: "string" },
-          whyItMatters: { type: "string" },
-        },
-        required: ["item", "whyItMatters"],
-      },
-    },
-  },
-  required: ["summary", "classification", "confidence"],
-};
+// Ollama Cloud (Nemotron) fallback — reached through its HTTPS API. The Ollama
+// daemon is NOT installed on the Render server; local mode is dev-only.
+const ollamaApiKey = (process.env.OLLAMA_API_KEY || "").trim();
+const ollamaBaseUrl = (process.env.OLLAMA_BASE_URL || "https://ollama.com").replace(/\/+$/, "");
+const ollamaModel = process.env.OLLAMA_MODEL || "nemotron:cloud";
+const ollamaTimeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS || 45000);
+// Local Ollama daemon (http://localhost:11434) for development only.
+const ollamaUrl = (process.env.OLLAMA_URL || "http://localhost:11434").replace(/\/+$/, "");
+const ollamaLocalEnabled = process.env.OLLAMA_LOCAL !== "0";
+const ollamaLocalModel = process.env.OLLAMA_LOCAL_MODEL || "qwen2.5:3b";
 
+const AI_PROVIDER = (process.env.AI_PROVIDER || "hybrid").toLowerCase();
+
+// Input selection bounds (characters). Small docs go whole; larger docs are
+// sampled intelligently instead of blindly truncated.
+const FULL_TEXT_LIMIT = Number(process.env.AI_FULL_TEXT_LIMIT || 40000);
+const SAMPLED_TEXT_BUDGET = Number(process.env.AI_TEXT_BUDGET || 80000);
+
+// Hard cap on generated tokens: a first-pass report is short by design.
+const GEMINI_NUM_PREDICT = Number(process.env.GEMINI_NUM_PREDICT || 700);
+const OLLAMA_NUM_PREDICT = Number(process.env.OLLAMA_NUM_PREDICT || 700);
+
+// ---------------------------------------------------------------------------
+// Response contract (shared by every provider — normalized once, below).
+// ---------------------------------------------------------------------------
 const geminiSchema = {
   type: "OBJECT",
   properties: {
@@ -79,7 +53,6 @@ const geminiSchema = {
         dates: { type: "ARRAY", items: { type: "STRING" } },
       },
     },
-    suspicious_points: { type: "ARRAY", items: { type: "STRING" } },
     timeline: {
       type: "ARRAY",
       items: {
@@ -108,6 +81,109 @@ const geminiSchema = {
   required: ["summary", "classification", "confidence"],
 };
 
+// JSON-schema `format` for Ollama (same contract as the Gemini schema).
+const ollamaFormat = {
+  type: "object",
+  properties: {
+    summary: { type: "string" },
+    classification: { type: "string" },
+    confidence: { type: "number" },
+    entities: {
+      type: "object",
+      properties: {
+        persons: { type: "array", items: { type: "string" } },
+        organizations: { type: "array", items: { type: "string" } },
+        locations: { type: "array", items: { type: "string" } },
+        dates: { type: "array", items: { type: "string" } },
+      },
+    },
+    timeline: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { date: { type: "string" }, event: { type: "string" } },
+        required: ["date", "event"],
+      },
+    },
+    relationships: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { relationship: { type: "string" }, support: { type: "string" } },
+        required: ["relationship", "support"],
+      },
+    },
+    followupEvidence: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { item: { type: "string" }, whyItMatters: { type: "string" } },
+        required: ["item", "whyItMatters"],
+      },
+    },
+  },
+  required: ["summary", "classification", "confidence"],
+};
+
+// ---------------------------------------------------------------------------
+// Compact prompt: no chain-of-thought, no essays, structured JSON only.
+// ---------------------------------------------------------------------------
+function buildPrompt(text) {
+  return `Analyze the supplied evidence for a legal/investigative case.
+
+Return ONLY valid JSON.
+
+Required:
+- summary: maximum 3 sentences
+- classification: evidence category
+- confidence: number 0-1
+- entities: { "persons": [], "organizations": [], "locations": [], "dates": [] } - only meaningful entities
+- relationships: [{ "relationship": "string", "support": "string" }] - only meaningful relationships
+- timeline: [{ "date": "string", "event": "string" }] - only important events
+- followupEvidence: [{ "item": "string", "whyItMatters": "string" }] - only useful follow-up
+
+Only include information directly supported by the evidence. Do not invent facts. Keep every list short and concise; no explanations.`;
+}
+
+// ---------------------------------------------------------------------------
+// Intelligent text selection: full text for normal documents, structured
+// head/tail/stride sampling for oversized ones. Never a blind cut.
+// ---------------------------------------------------------------------------
+export function selectEvidenceText(text) {
+  const total = text.length;
+  // Whole text fits comfortably in the model context budget: send it intact.
+  if (total <= SAMPLED_TEXT_BUDGET) {
+    return { text, strategy: "full", totalChars: total, selectedChars: total };
+  }
+
+  // Oversized: structured head/tail/stride sampling — never a blind cut.
+  const headShare = Math.floor(SAMPLED_TEXT_BUDGET * 0.4);
+  const tailShare = Math.floor(SAMPLED_TEXT_BUDGET * 0.4);
+  const midBudget = SAMPLED_TEXT_BUDGET - headShare - tailShare;
+
+  const head = text.slice(0, headShare);
+  const tail = text.slice(total - tailShare);
+
+  const middle = text.slice(headShare, total - tailShare);
+  const stride = Math.max(1, Math.floor(middle.length / Math.max(1, Math.floor(midBudget / 400))));
+  const slices = [];
+  for (let i = 0; i < middle.length && slices.length < 200; i += stride) {
+    slices.push(middle.slice(i, i + 400));
+  }
+  const sampledMiddle = slices.join("\n[…]\n");
+
+  const combined = `${head}\n[… middle portion condensed …]\n${sampledMiddle}\n[…]\n${tail}`;
+  return {
+    text: combined,
+    strategy: "sampled",
+    totalChars: total,
+    selectedChars: combined.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Parsing + validation (normalization layer shared by all providers).
+// ---------------------------------------------------------------------------
 function extractJson(value) {
   const cleaned = value.replace(/^```(?:json)?\s*|\s*```$/gi, "").trim();
   const start = cleaned.indexOf("{");
@@ -148,39 +224,41 @@ function validateAnalysis(result, sourceLabel) {
   return cleaned;
 }
 
-function buildPrompt(text) {
-  return `
-You are a digital-forensics evidence analyst. Return only valid JSON and use only the supplied evidence.
-
-Use this shape:
-{
-  "summary": "string",
-  "entities": { "persons": [], "organizations": [], "locations": [], "dates": [] },
-  "suspicious_points": ["string"],
-  "relationships": [{ "relationship": "string", "support": "string" }],
-  "timeline": [{ "date": "string", "event": "string" }],
-  "classification": "string",
-  "confidence": 0.0,
-  "followupEvidence": [{ "item": "string", "whyItMatters": "string" }]
+// ---------------------------------------------------------------------------
+// Error classification: which failures justify failing over to the next
+// provider? Provider quota/availability problems and unusable model output
+// both do; we never retry the same provider in a loop.
+// ---------------------------------------------------------------------------
+export function isProviderFailure(error) {
+  const message = String(error?.message || "");
+  const providerStatus = Number(error?.providerStatus || 0);
+  return (
+    providerStatus === 429 ||
+    providerStatus >= 500 ||
+    /timed out|unreachable|ECONN|ENOTFOUND|ETLS|high demand|invalid analysis JSON|missing required fields|invalid analysis object|empty analysis/i.test(
+      message,
+    )
+  );
 }
 
-Rules:
-- Never invent facts, names, dates, locations, motives, relationships, or suspicious activity.
-- Omit unsupported optional fields.
-- Keep the summary concise and distinguish facts from inferences.
-- Confidence must be a number from 0 to 1.
-
-Evidence:
-${text}
-`;
+function classifyHttpError(provider, status, payload) {
+  const error = new Error(
+    payload?.error?.message || `${provider} returned HTTP ${status}.`,
+  );
+  error.providerStatus = status;
+  return error;
 }
 
+// ---------------------------------------------------------------------------
+// Gemini (primary).
+// ---------------------------------------------------------------------------
 async function callGemini(prompt) {
   if (!geminiApiKey) {
     throw new Error("GEMINI_API_KEY is not configured.");
   }
 
   let response;
+  const attemptStartedAt = performance.now();
   try {
     response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`,
@@ -194,24 +272,24 @@ async function callGemini(prompt) {
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.1,
-            maxOutputTokens: Number(process.env.GEMINI_NUM_PREDICT || 2048),
+            maxOutputTokens: GEMINI_NUM_PREDICT,
             responseMimeType: "application/json",
             responseSchema: geminiSchema,
           },
         }),
-        signal: AbortSignal.timeout(requestTimeoutMs),
+        signal: AbortSignal.timeout(geminiTimeoutMs),
       },
     );
   } catch (error) {
     if (error.name === "TimeoutError" || error.name === "AbortError") {
-      throw new Error(`Gemini ${geminiModel} timed out after ${Math.round(requestTimeoutMs / 1000)}s.`);
+      throw new Error(`Gemini ${geminiModel} timed out after ${Math.round(geminiTimeoutMs / 1000)}s.`);
     }
     throw new Error(`Gemini is unreachable: ${error.message}`);
   }
 
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(payload?.error?.message || `Gemini returned HTTP ${response.status}.`);
+    throw classifyHttpError("Gemini", response.status, payload);
   }
 
   const responseText =
@@ -231,93 +309,182 @@ async function callGemini(prompt) {
     throw new Error("Gemini returned invalid analysis JSON.");
   }
 
-  return { result: validateAnalysis(parsed, "Gemini"), model: geminiModel };
+  const result = validateAnalysis(parsed, "Gemini");
+  return {
+    result,
+    model: geminiModel,
+    provider: "gemini",
+    attemptMs: Math.round(performance.now() - attemptStartedAt),
+  };
 }
 
-async function callOllama(model, prompt) {
+// ---------------------------------------------------------------------------
+// Ollama family (Nemotron cloud fallback; local daemon for dev).
+// ---------------------------------------------------------------------------
+async function callOllamaEndpoint({ label, url, model, prompt, apiKey, timeoutMs }) {
   let response;
+  const attemptStartedAt = performance.now();
   try {
-    response = await fetch(`${ollamaUrl}/api/generate`, {
+    response = await fetch(`${url}/api/generate`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
       body: JSON.stringify({
         model,
         prompt,
         stream: false,
-        format: analysisSchema,
+        format: ollamaFormat,
         keep_alive: process.env.OLLAMA_KEEP_ALIVE || "10m",
         options: {
           temperature: 0.1,
-          num_predict: Number(process.env.OLLAMA_NUM_PREDICT || 700),
+          num_predict: OLLAMA_NUM_PREDICT,
         },
       }),
-      signal: AbortSignal.timeout(requestTimeoutMs),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     if (error.cause?.code === "ECONNREFUSED" || error.code === "ECONNREFUSED") {
-      throw new Error("Ollama is unavailable. Start Ollama with `ollama serve` and try again.");
+      throw new Error(`${label} is unavailable (connection refused).`);
     }
     if (error.name === "TimeoutError" || error.name === "AbortError") {
-      throw new Error(`Ollama model ${model} timed out after ${Math.round(requestTimeoutMs / 1000)}s.`);
+      throw new Error(`${label} model ${model} timed out after ${Math.round(timeoutMs / 1000)}s.`);
     }
-    throw error;
+    throw new Error(`${label} is unreachable: ${error.message}`);
   }
 
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(payload?.error || `Ollama returned HTTP ${response.status} for ${model}.`);
+    throw classifyHttpError(label, response.status, payload);
   }
 
   if (typeof payload?.response !== "string" || !payload.response.trim()) {
-    throw new Error(`Ollama model ${model} returned an empty analysis.`);
+    throw new Error(`${label} model ${model} returned an empty analysis.`);
   }
 
   let parsed;
   try {
     parsed = JSON.parse(extractJson(payload.response));
   } catch {
-    throw new Error(`Ollama model ${model} returned invalid analysis JSON.`);
+    throw new Error(`${label} model ${model} returned invalid analysis JSON.`);
   }
 
-  return { result: validateAnalysis(parsed, `Ollama model ${model}`), model: payload.model || model };
+  const result = validateAnalysis(parsed, label);
+  return {
+    result,
+    model: payload.model || model,
+    provider: label,
+    attemptMs: Math.round(performance.now() - attemptStartedAt),
+  };
 }
 
+// ---------------------------------------------------------------------------
+// Orchestrator: Gemini first; fallback only on provider failure.
+// AI_PROVIDER=gemini skips fallbacks entirely; anything else runs hybrid.
+// ---------------------------------------------------------------------------
 export async function analyzeEvidence(text) {
+  const totalStartedAt = performance.now();
+  const timings = {};
+
+  const selectionStartedAt = performance.now();
+  const selection = selectEvidenceText(text);
+  timings.selectionMs = Math.round(performance.now() - selectionStartedAt);
+  timings.selectionStrategy = selection.strategy;
+  timings.totalChars = selection.totalChars;
+  timings.selectedChars = selection.selectedChars;
+
   const promptStartedAt = performance.now();
-  const prompt = buildPrompt(text);
-  const promptConstructionMs = Math.round(performance.now() - promptStartedAt);
+  const prompt = `${buildPrompt("")}\n\nEvidence:\n${selection.text}`;
+  timings.promptMs = Math.round(performance.now() - promptStartedAt);
 
   const attempts = [];
   if (geminiApiKey) {
-    attempts.push({ tier: "cloud", label: `gemini (${geminiModel})`, run: () => callGemini(prompt) });
+    attempts.push({
+      label: "gemini",
+      run: () => callGemini(prompt),
+    });
   }
-  attempts.push({ tier: "cloud", label: `ollama-cloud (${cloudModel})`, run: () => callOllama(cloudModel, prompt) });
-  attempts.push({ tier: "local", label: `ollama-local (${ollamaModel})`, run: () => callOllama(ollamaModel, prompt) });
 
-  const failures = [];
-  const inferenceStartedAt = performance.now();
-
-  for (const attempt of attempts) {
-    try {
-      const { result, model } = await attempt.run();
-      const inferenceMs = Math.round(performance.now() - inferenceStartedAt);
-      return {
-        result,
-        model,
-        provider: attempt.tier,
-        timings: {
-          promptConstructionMs,
-          inferenceMs,
-        },
-      };
-    } catch (error) {
-      failures.push(`${attempt.label}: ${error.message}`);
+  if (AI_PROVIDER !== "gemini") {
+    if (ollamaApiKey) {
+      attempts.push({
+        label: "ollama-cloud",
+        run: () =>
+          callOllamaEndpoint({
+            label: "ollama-cloud",
+            url: ollamaBaseUrl,
+            model: ollamaModel,
+            prompt,
+            apiKey: ollamaApiKey,
+            timeoutMs: ollamaTimeoutMs,
+          }),
+      });
+    }
+    if (ollamaLocalEnabled) {
+      attempts.push({
+        label: "ollama-local",
+        run: () =>
+          callOllamaEndpoint({
+            label: "ollama-local",
+            url: ollamaUrl,
+            model: ollamaLocalModel,
+            prompt,
+            apiKey: "",
+            timeoutMs: 10000,
+          }),
+      });
     }
   }
 
-  const error = new Error(
-    `Hybrid AI analysis failed on all providers. ${failures.join(" | ")}`,
-  );
+  if (!attempts.length) {
+    throw new Error("No AI provider is configured (GEMINI_API_KEY / OLLAMA_API_KEY missing).");
+  }
+
+  const failures = [];
+  let fallbackMs = 0;
+
+  for (let index = 0; index < attempts.length; index += 1) {
+    const attempt = attempts[index];
+    const attemptStartedAt = performance.now();
+    try {
+      const outcome = await attempt.run();
+      if (index > 0) {
+        fallbackMs += Math.round(performance.now() - attemptStartedAt);
+      }
+
+      const totalMs = Math.round(performance.now() - totalStartedAt);
+      timings.geminiMs = index === 0 ? outcome.attemptMs : 0;
+      timings.fallbackMs = fallbackMs;
+      timings.totalMs = totalMs;
+
+      console.info(
+        `[AI-PERF] provider=${outcome.provider} model=${outcome.model} strategy=${selection.strategy} ` +
+          `prompt:${timings.promptMs}ms gemini:${timings.geminiMs}ms fallback:${fallbackMs}ms total:${totalMs}ms ` +
+          `chars:${selection.totalChars}->${selection.selectedChars}`,
+      );
+
+      return {
+        result: outcome.result,
+        model: outcome.model,
+        provider: outcome.provider,
+        timings,
+      };
+    } catch (error) {
+      if (index > 0) {
+        fallbackMs += Math.round(performance.now() - attemptStartedAt);
+      }
+      failures.push(`${attempt.label}: ${error.message}`);
+      // Only keep waiting on providers when the failure is the provider's
+      // (quota/availability/timeout). Anything else still fails over, but the
+      // classification is what keeps this from retrying endlessly.
+      if (!isProviderFailure(error) && index === attempts.length - 1) {
+        break;
+      }
+    }
+  }
+
+  const error = new Error(`AI analysis failed on all providers. ${failures.join(" | ")}`);
   error.failures = failures;
   throw error;
 }
