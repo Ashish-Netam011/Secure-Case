@@ -586,13 +586,11 @@ app.get("/api/audit-events", async (req, res, next) => {
     next(error);
   }
 });
-
-app.get("/health",(req,res)=>{
-  const successResponse = (response, payload) => response.json(payload);
-  successResponse(res, {
-    status:"ok",
-    timestamp:new Date().toISOString(),
-    uptime:process.uptime()
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
   });
 });
 
