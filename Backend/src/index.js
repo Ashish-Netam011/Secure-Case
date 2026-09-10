@@ -146,8 +146,14 @@ function getEvidenceHash(data) {
 }
 
 async function verifyEvidenceIntegrity(evidence, req) {
+  // A missing stored hash or missing stored bytes means verification is not
+  // possible — that is NEVER a TAMPERED verdict (fail-closed, but distinct).
+  if (!evidence?.sha256 || !evidence.data) {
+    return "INTEGRITY_UNAVAILABLE";
+  }
+
   const currentHash = getEvidenceHash(evidence.data);
-  if (currentHash === evidence.sha256) return true;
+  if (currentHash === evidence.sha256) return "INTACT";
 
   await recordAudit({
     action: "Evidence tampering detected",
@@ -156,7 +162,7 @@ async function verifyEvidenceIntegrity(evidence, req) {
     evidence: evidence._id,
     reason: `Stored hash ${evidence.sha256} does not match current hash ${currentHash}.`,
   });
-  return false;
+  return "TAMPERED";
 }
 
 async function getAuthorizedEvidence(id, req) {
@@ -413,16 +419,19 @@ app.post("/api/ai/analyze", requireRole("Administrator","Investigating Officer",
 app.get("/api/evidence", async (req, res, next) => {
   try {
     const evidence = await Evidence.find()
+      .select("+data")
       .sort({ createdAt: -1 })
       .lean();
     const data = evidence.map((item) => {
       const { data: fileData, ...metadata } = item;
       const currentHash = fileData ? getEvidenceHash(fileData) : null;
-      const integrityStatus = fileData
-        ? currentHash === item.sha256
-          ? "VERIFIED"
-          : "TAMPERED"
-        : "UNKNOWN";
+      // Missing hash or missing bytes means integrity verification is not
+      // possible — do NOT label the evidence TAMPERED in that case.
+      const integrityStatus = !item.sha256 || !fileData
+        ? "INTEGRITY_UNAVAILABLE"
+        : currentHash === item.sha256
+          ? "INTACT"
+          : "TAMPERED";
       return {
         ...metadata,
         sha256Current: currentHash ?? undefined,
@@ -525,8 +534,12 @@ app.get("/api/evidence/:id/content", async (req, res, next) => {
     const authorization = await getAuthorizedEvidence(req.params.id, req);
     if (authorization.error) return res.status(authorization.error.status).json({ success: false, message: authorization.error.message });
     const { evidence } = authorization;
-    if (!(await verifyEvidenceIntegrity(evidence, req))) {
+    const integrity = await verifyEvidenceIntegrity(evidence, req);
+    if (integrity === "TAMPERED") {
       return res.status(409).json({ success: false, code: "EVIDENCE_TAMPERED", message: "TAMPER ALERT: Evidence tampering detected — integrity verification failed. Access has been blocked." });
+    }
+    if (integrity !== "INTACT") {
+      return res.status(423).json({ success: false, code: "EVIDENCE_INTEGRITY_UNAVAILABLE", message: "Evidence integrity cannot be verified because a stored hash is unavailable. Access has been blocked." });
     }
     const administrator = req.user.role === "Administrator";
 

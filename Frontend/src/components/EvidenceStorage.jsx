@@ -86,6 +86,11 @@ function EvidenceStorage({ user, refreshKey = 0, onLog }) {
       onLog?.(`Tamper detected and access blocked: ${item.filename}`, "ALERT");
       return;
     }
+    if (item.integrityStatus === "INTEGRITY_UNAVAILABLE") {
+      setMessage(`${item.filename} integrity cannot be verified because a stored SHA-256 hash is unavailable. Access has been blocked.`);
+      onLog?.(`Integrity verification unavailable, access blocked: ${item.filename}`, "BLOCKED");
+      return;
+    }
     const request = requestForEvidence(item);
     const isOwner = item.uploadedBy === user.id;
     if (!isAdmin && !isOwner && request?.status !== "APPROVED") return;
@@ -157,8 +162,8 @@ function EvidenceStorage({ user, refreshKey = 0, onLog }) {
                   <td className="px-3 py-4"><p className="text-[10px] text-slate-300">{item.uploadedBy}</p><p className="text-[9px] text-slate-600">{item.uploadedByRole}</p></td>
                   <td className="px-3 py-4 text-[10px] text-slate-400">{formatDate(item.createdAt)}</td>
                   <td className="px-3 py-4 text-[10px] text-slate-400">{item.mimetype}<br />{(item.size / 1024).toFixed(1)} KB</td>
-                  <td className="px-3 py-4">{item.integrityStatus === "VERIFIED" ? <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400"><Check size={12} /> Verified</span> : <span className="flex items-center gap-1.5 text-[10px] font-semibold text-red-400"><AlertTriangle size={12} /> Tampered</span>}</td>
-                  <td className="px-3 py-4">{item.integrityStatus === "TAMPERED" ? <span className="flex items-center gap-1.5 text-[10px] font-semibold text-red-400"><ShieldAlert size={12} /> Blocked</span> : approved ? <button onClick={() => openEvidence(item)} className="flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-[10px] font-semibold text-emerald-400"><Eye size={12} /> View</button> : request?.status === "PENDING" ? <span className="flex items-center gap-1.5 text-[10px] text-amber-400"><Clock3 size={12} /> Pending</span> : request?.status === "REJECTED" ? <button onClick={() => requestFor(item)} className="text-[10px] text-slate-400 underline">Request again</button> : <button onClick={() => requestFor(item)} className="flex items-center gap-1.5 rounded-md border border-slate-700 px-2.5 py-2 text-[10px] text-slate-300"><Lock size={12} /> Request access</button>}</td>
+                  <td className="px-3 py-4">{item.integrityStatus === "INTACT" ? <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400"><Check size={12} /> Verified</span> : item.integrityStatus === "TAMPERED" ? <span className="flex items-center gap-1.5 text-[10px] font-semibold text-red-400"><AlertTriangle size={12} /> Tampered</span> : <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400"><Clock3 size={12} /> Integrity unavailable</span>}</td>
+                  <td className="px-3 py-4">{item.integrityStatus === "TAMPERED" || item.integrityStatus === "INTEGRITY_UNAVAILABLE" ? <span className="flex items-center gap-1.5 text-[10px] font-semibold text-red-400"><ShieldAlert size={12} /> Blocked</span> : approved ? <button onClick={() => openEvidence(item)} className="flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-[10px] font-semibold text-emerald-400"><Eye size={12} /> View</button> : request?.status === "PENDING" ? <span className="flex items-center gap-1.5 text-[10px] text-amber-400"><Clock3 size={12} /> Pending</span> : request?.status === "REJECTED" ? <button onClick={() => requestFor(item)} className="text-[10px] text-slate-400 underline">Request again</button> : <button onClick={() => requestFor(item)} className="flex items-center gap-1.5 rounded-md border border-slate-700 px-2.5 py-2 text-[10px] text-slate-300"><Lock size={12} /> Request access</button>}</td>
                 </tr>;
               })}
             </tbody>
